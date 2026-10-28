@@ -1,0 +1,27 @@
+# Firebase configuration is project-specific. Keep it out of source control.
+app/google-services.json
+
+# Local Android and IDE state
+local.properties
+.idea/
+.kotlin/
+.vscode/
+.gradle/
+build/
+app/build/
+work/
+
+# Permanent signing identity. It is deliberately local-only; losing it means
+# future APKs cannot update an already-installed release.
+.keys/
+
+# Distributable APKs are shared through releases/Drive, not committed with source.
+outputs/*.apk*
+outputs/*.zip
+
+# Firebase Functions dependencies and local deployment state.
+backend/firebase/functions/node_modules/
+backend/firebase/.firebase/
+
+# macOS Finder metadata.
+.DS_Store

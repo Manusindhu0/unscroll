@@ -1,0 +1,473 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function sessionPath(sessionId) {
+      return /databases/$(database)/documents/focusSessions/$(sessionId);
+    }
+
+    function handlePath(handle) {
+      return /databases/$(database)/documents/handles/$(handle);
+    }
+
+    function invitePath(code) {
+      return /databases/$(database)/documents/friendInvites/$(code);
+    }
+
+    function friendPath(uid, friendUid) {
+      return /databases/$(database)/documents/users/$(uid)/friends/$(friendUid);
+    }
+
+    function inviteRatePath(uid) {
+      return /databases/$(database)/documents/users/$(uid)/rateLimits/invite;
+    }
+
+    function validUsername(value) {
+      return value is string && value.size() >= 3 && value.size() <= 20 &&
+        value.matches('^[A-Za-z0-9_]+$');
+    }
+
+    function validDuration(value) {
+      return value == 25 || value == 45 || value == 60;
+    }
+
+    function validActivePractice(value) {
+      return value is map && value.keys().hasOnly([
+          'task', 'craft', 'durationMinutes', 'endsAt', 'startedAt'
+        ]) &&
+        // A blank task means the member kept their exact work private.
+        value.task is string && value.task.size() <= 140 &&
+        value.craft is string && value.craft.size() >= 1 && value.craft.size() <= 32 &&
+        validDuration(value.durationMinutes) &&
+        value.endsAt is timestamp && value.startedAt is timestamp;
+    }
+
+    // Rules cannot query an unbounded collection count. Instead, each invite
+    // creation must atomically advance this owner-only server timestamp. It
+    // limits invite creation to one per minute without Cloud Functions.
+    function validInviteRate(uid) {
+      let rate = getAfter(inviteRatePath(uid)).data;
+      return rate.keys().hasOnly(['lastCreatedAt']) &&
+        rate.lastCreatedAt == request.time &&
+        (!exists(inviteRatePath(uid)) ||
+          request.time >= get(inviteRatePath(uid)).data.lastCreatedAt + duration.value(1, 'm'));
+    }
+
+    function publicProfile(data, uid) {
+      return data.keys().hasOnly([
+          'uid', 'username', 'handle', 'createdAt', 'updatedAt',
+          'leaguePoints', 'totalFocusMinutes', 'startedRounds',
+          'completedRounds', 'bestRoundMinutes', 'activeSessionId',
+          'activeSessionEndsAt', 'activePractice', 'lastCompletedWeekKey',
+          'mainCraft', 'shareWorkNames'
+        ]) &&
+        data.uid == uid && validUsername(data.username) &&
+        data.handle is string && data.handle.size() >= 3 && data.handle.size() <= 20 &&
+        data.leaguePoints is int && data.leaguePoints >= 0 &&
+        data.totalFocusMinutes is int && data.totalFocusMinutes >= 0 &&
+        data.startedRounds is int && data.startedRounds >= 0 &&
+        data.completedRounds is int && data.completedRounds >= 0 &&
+        data.bestRoundMinutes is int && data.bestRoundMinutes >= 0 &&
+        data.mainCraft is string && data.mainCraft.size() >= 1 && data.mainCraft.size() <= 32 &&
+        data.shareWorkNames is bool &&
+        data.get('lastCompletedWeekKey', '') is string &&
+        (data.get('activePractice', null) == null || validActivePractice(data.activePractice)) &&
+        data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+
+    function hasNoActiveSession(data) {
+      return data.get('activeSessionId', null) == null &&
+        data.get('activeSessionEndsAt', null) == null;
+    }
+
+    function createdProfile(uid) {
+      return publicProfile(request.resource.data, uid) &&
+        hasNoActiveSession(request.resource.data) &&
+        request.resource.data.leaguePoints == 0 &&
+        request.resource.data.totalFocusMinutes == 0 &&
+        request.resource.data.startedRounds == 0 &&
+        request.resource.data.completedRounds == 0 &&
+        request.resource.data.bestRoundMinutes == 0 &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.updatedAt == request.time &&
+        existsAfter(handlePath(request.resource.data.handle)) &&
+        getAfter(handlePath(request.resource.data.handle)).data.uid == uid;
+    }
+
+    function profileEdit(uid) {
+      return publicProfile(request.resource.data, uid) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['username', 'handle', 'mainCraft', 'shareWorkNames', 'updatedAt']) &&
+        request.resource.data.updatedAt == request.time &&
+        (resource.data.get('mainCraft', null) == null ||
+          request.resource.data.mainCraft == resource.data.mainCraft) &&
+        (resource.data.get('shareWorkNames', null) == null ||
+          request.resource.data.shareWorkNames == resource.data.shareWorkNames) &&
+        getAfter(handlePath(request.resource.data.handle)).data.uid == uid &&
+        (request.resource.data.handle == resource.data.handle ||
+          !existsAfter(handlePath(resource.data.handle)));
+    }
+
+    function privacyEdit(uid) {
+      return publicProfile(request.resource.data, uid) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['shareWorkNames', 'activePractice', 'updatedAt']) &&
+        request.resource.data.updatedAt == request.time &&
+        // Enabling never restores an older task name. A later focus round will
+        // share it only if the member actively opted in.
+        (request.resource.data.shareWorkNames == true ||
+          request.resource.data.get('activePractice', null) == null ||
+          request.resource.data.activePractice.task == '');
+    }
+
+    function focusStart(uid) {
+      let session = getAfter(sessionPath(request.resource.data.activeSessionId)).data;
+      return publicProfile(request.resource.data, uid) &&
+        hasNoActiveSession(resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'activeSessionId', 'activeSessionEndsAt', 'activePractice', 'mainCraft',
+          'shareWorkNames', 'startedRounds', 'updatedAt'
+        ]) &&
+        request.resource.data.activeSessionId is string &&
+        request.resource.data.activeSessionEndsAt is timestamp &&
+        validActivePractice(request.resource.data.activePractice) &&
+        request.resource.data.mainCraft == session.craft &&
+        request.resource.data.shareWorkNames is bool &&
+        request.resource.data.startedRounds == resource.data.startedRounds + 1 &&
+        request.resource.data.updatedAt == request.time &&
+        session.uid == uid && session.status == 'active' &&
+        session.endsAt == request.resource.data.activeSessionEndsAt &&
+        ((request.resource.data.shareWorkNames == true &&
+            request.resource.data.activePractice.task == session.task) ||
+          (request.resource.data.shareWorkNames == false &&
+            request.resource.data.activePractice.task == '')) &&
+        request.resource.data.activePractice.craft == session.craft &&
+        request.resource.data.activePractice.durationMinutes == session.durationMinutes &&
+        request.resource.data.activePractice.endsAt == session.endsAt &&
+        request.resource.data.activePractice.startedAt == session.startedAt;
+    }
+
+    function focusCompletion(uid) {
+      let id = resource.data.activeSessionId;
+      let session = getAfter(sessionPath(id)).data;
+      let minutes = session.durationMinutes;
+      return publicProfile(request.resource.data, uid) &&
+        resource.data.activeSessionId is string &&
+        hasNoActiveSession(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'activeSessionId', 'activeSessionEndsAt', 'leaguePoints',
+          'activePractice', 'totalFocusMinutes', 'completedRounds', 'bestRoundMinutes',
+          'mainCraft', 'shareWorkNames', 'lastCompletedWeekKey', 'updatedAt'
+        ]) &&
+        request.resource.data.get('activePractice', null) == null &&
+        session.uid == uid && session.status == 'completed' &&
+        request.resource.data.leaguePoints == resource.data.leaguePoints + minutes &&
+        request.resource.data.totalFocusMinutes == resource.data.totalFocusMinutes + minutes &&
+        request.resource.data.completedRounds == resource.data.completedRounds + 1 &&
+        request.resource.data.mainCraft is string &&
+        request.resource.data.shareWorkNames is bool &&
+        (resource.data.get('mainCraft', null) == null ||
+          request.resource.data.mainCraft == resource.data.mainCraft) &&
+        (resource.data.get('shareWorkNames', null) == null ||
+          request.resource.data.shareWorkNames == resource.data.shareWorkNames) &&
+        request.resource.data.lastCompletedWeekKey is string &&
+        request.resource.data.lastCompletedWeekKey.size() == 10 &&
+        (
+          (minutes <= resource.data.bestRoundMinutes &&
+            request.resource.data.bestRoundMinutes == resource.data.bestRoundMinutes) ||
+          (minutes > resource.data.bestRoundMinutes &&
+            request.resource.data.bestRoundMinutes == minutes)
+        ) &&
+        request.resource.data.updatedAt == request.time;
+    }
+
+    function focusEarlyEnd(uid) {
+      let id = resource.data.activeSessionId;
+      let session = getAfter(sessionPath(id)).data;
+      return publicProfile(request.resource.data, uid) &&
+        resource.data.activeSessionId is string &&
+        hasNoActiveSession(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'activeSessionId', 'activeSessionEndsAt', 'activePractice',
+          'mainCraft', 'shareWorkNames', 'updatedAt'
+        ]) &&
+        request.resource.data.get('activePractice', null) == null &&
+        request.resource.data.mainCraft is string &&
+        request.resource.data.shareWorkNames is bool &&
+        (resource.data.get('mainCraft', null) == null ||
+          request.resource.data.mainCraft == resource.data.mainCraft) &&
+        (resource.data.get('shareWorkNames', null) == null ||
+          request.resource.data.shareWorkNames == resource.data.shareWorkNames) &&
+        session.uid == uid && session.status == 'endedEarly' &&
+        request.resource.data.updatedAt == request.time;
+    }
+
+    function validFocusCreation(uid) {
+      return request.resource.data.keys().hasOnly([
+          'uid', 'task', 'craft', 'durationMinutes', 'startedAt', 'endsAt', 'status'
+        ]) &&
+        request.resource.data.uid == uid &&
+        request.resource.data.task is string && request.resource.data.task.size() >= 1 &&
+        request.resource.data.task.size() <= 140 &&
+        request.resource.data.craft is string && request.resource.data.craft.size() >= 1 &&
+        request.resource.data.craft.size() <= 32 &&
+        validDuration(request.resource.data.durationMinutes) &&
+        request.resource.data.startedAt == request.time &&
+        request.resource.data.endsAt is timestamp &&
+        request.resource.data.endsAt >= request.time + duration.value(request.resource.data.durationMinutes, 'm') &&
+        request.resource.data.endsAt <= request.time + duration.value(request.resource.data.durationMinutes + 5, 'm') &&
+        request.resource.data.status == 'active';
+    }
+
+    function completedSession(uid) {
+      return resource.data.uid == uid && resource.data.status == 'active' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'completedAt']) &&
+        request.resource.data.status == 'completed' &&
+        request.resource.data.completedAt == request.time &&
+        request.time >= resource.data.endsAt &&
+        getAfter(userPath(uid)).data.get('activeSessionId', null) == null;
+    }
+
+    function validWeeklyScore(uid, weekKey) {
+      return request.resource.data.keys().hasOnly([
+          'uid', 'username', 'weekKey', 'minutes', 'sessionId', 'updatedAt'
+        ]) &&
+        request.resource.data.uid == uid &&
+        request.resource.data.username == getAfter(userPath(uid)).data.username &&
+        request.resource.data.weekKey == weekKey &&
+        request.resource.data.minutes is int && request.resource.data.minutes >= 0 &&
+        request.resource.data.sessionId is string && request.resource.data.updatedAt == request.time;
+    }
+
+    // A weekly total can only move alongside the one focus session that just
+    // completed. The profile pins the week key, preventing a session from
+    // being copied into multiple weekly documents.
+    function weeklyCompletion(uid, weekKey) {
+      let sessionId = request.resource.data.sessionId;
+      let focus = getAfter(sessionPath(sessionId)).data;
+      let beforeProfile = get(userPath(uid)).data;
+      let afterProfile = getAfter(userPath(uid)).data;
+      return beforeProfile.activeSessionId == sessionId &&
+        afterProfile.activeSessionId == null &&
+        afterProfile.completedRounds == beforeProfile.completedRounds + 1 &&
+        afterProfile.lastCompletedWeekKey == weekKey &&
+        focus.uid == uid && focus.status == 'completed';
+    }
+
+    function sharedWeekDayTotal(data) {
+      return data.mon + data.tue + data.wed + data.thu + data.fri + data.sat + data.sun;
+    }
+
+    function validSharedWeek(uid, weekKey) {
+      return request.resource.data.keys().hasOnly([
+          'uid', 'username', 'weekKey', 'minutes', 'sessionId', 'updatedAt',
+          'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'
+        ]) &&
+        request.resource.data.uid == uid &&
+        request.resource.data.username == getAfter(userPath(uid)).data.username &&
+        request.resource.data.weekKey == weekKey &&
+        request.resource.data.minutes is int && request.resource.data.minutes >= 0 &&
+        request.resource.data.sessionId is string && request.resource.data.updatedAt == request.time &&
+        request.resource.data.mon is int && request.resource.data.mon >= 0 &&
+        request.resource.data.tue is int && request.resource.data.tue >= 0 &&
+        request.resource.data.wed is int && request.resource.data.wed >= 0 &&
+        request.resource.data.thu is int && request.resource.data.thu >= 0 &&
+        request.resource.data.fri is int && request.resource.data.fri >= 0 &&
+        request.resource.data.sat is int && request.resource.data.sat >= 0 &&
+        request.resource.data.sun is int && request.resource.data.sun >= 0 &&
+        sharedWeekDayTotal(request.resource.data) == request.resource.data.minutes;
+    }
+
+    function sharedWeekCreate(uid, weekKey) {
+      let focus = getAfter(sessionPath(request.resource.data.sessionId)).data;
+      return validSharedWeek(uid, weekKey) && weeklyCompletion(uid, weekKey) &&
+        request.resource.data.minutes == focus.durationMinutes;
+    }
+
+    function sharedWeekUpdate(uid, weekKey) {
+      let focus = getAfter(sessionPath(request.resource.data.sessionId)).data;
+      return validSharedWeek(uid, weekKey) && weeklyCompletion(uid, weekKey) &&
+        request.resource.data.minutes == resource.data.minutes + focus.durationMinutes &&
+        sharedWeekDayTotal(request.resource.data) ==
+          sharedWeekDayTotal(resource.data) + focus.durationMinutes &&
+        request.resource.data.mon >= resource.data.mon &&
+        request.resource.data.tue >= resource.data.tue &&
+        request.resource.data.wed >= resource.data.wed &&
+        request.resource.data.thu >= resource.data.thu &&
+        request.resource.data.fri >= resource.data.fri &&
+        request.resource.data.sat >= resource.data.sat &&
+        request.resource.data.sun >= resource.data.sun;
+    }
+
+    function validSharedWin(uid) {
+      let focus = getAfter(sessionPath(request.resource.data.sessionId)).data;
+      let owner = getAfter(userPath(uid)).data;
+      return request.resource.data.keys().hasOnly([
+          'uid', 'sessionId', 'craft', 'task', 'durationMinutes', 'completedAt'
+        ]) &&
+        request.resource.data.uid == uid && request.resource.data.sessionId is string &&
+        request.resource.data.craft is string && request.resource.data.craft.size() >= 1 &&
+        request.resource.data.craft.size() <= 32 &&
+        request.resource.data.task is string && request.resource.data.task.size() <= 140 &&
+        validDuration(request.resource.data.durationMinutes) &&
+        request.resource.data.completedAt == request.time &&
+        focus.uid == uid && focus.status == 'completed' &&
+        request.resource.data.craft == focus.craft &&
+        request.resource.data.durationMinutes == focus.durationMinutes &&
+        ((owner.shareWorkNames == true && request.resource.data.task == focus.task) ||
+          (owner.shareWorkNames == false && request.resource.data.task == ''));
+    }
+
+    function earlyEndedSession(uid) {
+      return resource.data.uid == uid && resource.data.status == 'active' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'endedAt']) &&
+        request.resource.data.status == 'endedEarly' &&
+        request.resource.data.endedAt == request.time &&
+        getAfter(userPath(uid)).data.get('activeSessionId', null) == null;
+    }
+
+    match /users/{uid} {
+      // A League is a private friends circle. The app reads each accepted friend
+      // by document id; collection-wide user discovery is deliberately disabled.
+      // A profile is visible only to its owner or an accepted friend.
+      allow get: if signedIn() &&
+        (request.auth.uid == uid || exists(friendPath(request.auth.uid, uid)));
+      allow list: if false;
+      allow create: if signedIn() && request.auth.uid == uid && createdProfile(uid);
+      allow update: if signedIn() && request.auth.uid == uid &&
+        (profileEdit(uid) || privacyEdit(uid) || focusStart(uid) || focusCompletion(uid) || focusEarlyEnd(uid));
+      allow delete: if false;
+
+      match /friends/{friendUid} {
+        allow get, list: if signedIn() && request.auth.uid == uid;
+        allow create: if signedIn() &&
+          request.resource.data.keys().hasOnly(['uid', 'username', 'inviteCode', 'addedAt']) &&
+          request.resource.data.uid == friendUid && request.resource.data.username is string &&
+          request.resource.data.inviteCode is string && request.resource.data.addedAt == request.time &&
+          getAfter(invitePath(request.resource.data.inviteCode)).data.acceptedBy == request.auth.uid &&
+          (
+            (getAfter(invitePath(request.resource.data.inviteCode)).data.ownerUid == uid &&
+              getAfter(invitePath(request.resource.data.inviteCode)).data.acceptedBy == friendUid) ||
+            (getAfter(invitePath(request.resource.data.inviteCode)).data.ownerUid == friendUid &&
+              getAfter(invitePath(request.resource.data.inviteCode)).data.acceptedBy == uid)
+          ) &&
+          existsAfter(friendPath(friendUid, uid)) &&
+          request.resource.data.username == getAfter(userPath(friendUid)).data.username;
+        allow update: if false;
+        // Both mirrored friend documents must be removed in one transaction.
+        allow delete: if signedIn() &&
+          (request.auth.uid == uid || request.auth.uid == friendUid) &&
+          !existsAfter(friendPath(friendUid, uid));
+      }
+
+      match /weeklyScores/{weekKey} {
+        // A score is readable only by its owner or someone in the owner's
+        // accepted friend list. Collection discovery remains off.
+        allow get: if signedIn() &&
+          (request.auth.uid == uid || exists(friendPath(request.auth.uid, uid)));
+        allow list: if false;
+        allow create: if signedIn() && request.auth.uid == uid &&
+          validWeeklyScore(uid, weekKey) && weeklyCompletion(uid, weekKey) &&
+          request.resource.data.minutes == getAfter(sessionPath(request.resource.data.sessionId)).data.durationMinutes;
+        allow update: if signedIn() && request.auth.uid == uid &&
+          validWeeklyScore(uid, weekKey) && weeklyCompletion(uid, weekKey) &&
+          request.resource.data.minutes == resource.data.minutes +
+            getAfter(sessionPath(request.resource.data.sessionId)).data.durationMinutes;
+        allow delete: if false;
+      }
+
+      // These are intentionally small, friends-visible summaries. The raw
+      // /focusSessions collection remains readable by its owner only.
+      match /sharedWeeks/{weekKey} {
+        allow get: if signedIn() &&
+          (request.auth.uid == uid || exists(friendPath(request.auth.uid, uid)));
+        allow list: if false;
+        allow create: if signedIn() && request.auth.uid == uid && sharedWeekCreate(uid, weekKey);
+        allow update: if signedIn() && request.auth.uid == uid && sharedWeekUpdate(uid, weekKey);
+        allow delete: if false;
+      }
+
+      match /sharedWins/{sessionId} {
+        allow get, list: if signedIn() &&
+          (request.auth.uid == uid || exists(friendPath(request.auth.uid, uid)));
+        allow create: if signedIn() && request.auth.uid == uid &&
+          request.resource.data.sessionId == sessionId && validSharedWin(uid);
+        // Turning off work-name sharing can only erase existing names.
+        allow update: if signedIn() && request.auth.uid == uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['task']) &&
+          request.resource.data.task == '' &&
+          get(userPath(uid)).data.shareWorkNames == false;
+        allow delete: if false;
+      }
+
+      match /rateLimits/{limit} {
+        allow get, list: if false;
+        allow create, update: if signedIn() && request.auth.uid == uid &&
+          limit == 'invite' && validInviteRate(uid);
+        allow delete: if false;
+      }
+    }
+
+    match /handles/{handle} {
+      // A handle only contains the public username and owning uid. Reads are
+      // needed during the atomic "is this username already taken?" check.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['uid', 'username', 'updatedAt']) &&
+        request.resource.data.uid == request.auth.uid && validUsername(request.resource.data.username) &&
+        request.resource.data.updatedAt == request.time && existsAfter(userPath(request.auth.uid)) &&
+        getAfter(userPath(request.auth.uid)).data.handle == handle &&
+        getAfter(userPath(request.auth.uid)).data.username == request.resource.data.username;
+      allow update: if signedIn() && resource.data.uid == request.auth.uid &&
+        request.resource.data.keys().hasOnly(['uid', 'username', 'updatedAt']) &&
+        request.resource.data.uid == request.auth.uid && validUsername(request.resource.data.username) &&
+        request.resource.data.updatedAt == request.time &&
+        getAfter(userPath(request.auth.uid)).data.handle == handle &&
+        getAfter(userPath(request.auth.uid)).data.username == request.resource.data.username;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid &&
+        (!existsAfter(userPath(request.auth.uid)) ||
+          getAfter(userPath(request.auth.uid)).data.handle != handle);
+    }
+
+    match /focusSessions/{sessionId} {
+      allow get: if signedIn() && resource.data.uid == request.auth.uid;
+      allow list: if signedIn() && resource.data.uid == request.auth.uid && request.query.limit <= 100;
+      allow create: if signedIn() && validFocusCreation(request.auth.uid) &&
+        getAfter(userPath(request.auth.uid)).data.activeSessionId == sessionId;
+      allow update: if signedIn() &&
+        (completedSession(request.auth.uid) || earlyEndedSession(request.auth.uid));
+      allow delete: if false;
+    }
+
+    match /friendInvites/{code} {
+      // Codes are random 128-bit values; they are not enumerable.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.keys().hasOnly([
+          'ownerUid', 'ownerUsername', 'createdAt', 'expiresAt', 'acceptedBy'
+        ]) && request.resource.data.ownerUid == request.auth.uid &&
+        validUsername(request.resource.data.ownerUsername) &&
+        request.resource.data.ownerUsername == get(userPath(request.auth.uid)).data.username &&
+        request.resource.data.createdAt == request.time && request.resource.data.acceptedBy == null &&
+        request.resource.data.expiresAt is timestamp &&
+        validInviteRate(request.auth.uid) &&
+        request.resource.data.expiresAt >= request.time + duration.value(6, 'd') + duration.value(23, 'h') &&
+        request.resource.data.expiresAt <= request.time + duration.value(7, 'd') + duration.value(5, 'm');
+      allow update: if signedIn() && resource.data.ownerUid != request.auth.uid &&
+        resource.data.acceptedBy == null && request.time <= resource.data.expiresAt &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['acceptedBy', 'acceptedAt']) &&
+        request.resource.data.acceptedBy == request.auth.uid &&
+        request.resource.data.acceptedAt == request.time &&
+        existsAfter(friendPath(resource.data.ownerUid, request.auth.uid)) &&
+        existsAfter(friendPath(request.auth.uid, resource.data.ownerUid));
+      allow delete: if false;
+    }
+  }
+}

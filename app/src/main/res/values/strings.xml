@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Unscroll</string>
+    <string name="notification_channel_name">Unscroll reminders</string>
+</resources>

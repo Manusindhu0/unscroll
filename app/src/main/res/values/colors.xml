@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="night">#0A0A0B</color>
+    <color name="surface">#151518</color>
+    <color name="surface_card">#1A1A1F</color>
+    <color name="surface_high">#202024</color>
+    <color name="divider">#2A2A30</color>
+    <color name="ink">#F5F4F1</color>
+    <color name="muted">#AAA9AF</color>
+    <color name="focus_red">#FF4C46</color>
+    <color name="focus_red_muted">#3D1A1A</color>
+    <color name="focus_yellow">#F7C949</color>
+    <color name="focus_green">#58D68D</color>
+    <color name="focus_green_bright">#8AF2B0</color>
+    <color name="focus_green_muted">#1E4D35</color>
+    <color name="league_gold">#D4A843</color>
+    <color name="league_gold_muted">#403313</color>
+</resources>
